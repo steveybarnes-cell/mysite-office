@@ -1010,6 +1010,8 @@ svg.leaflet-image-layer.leaflet-interactive path {
   <section class="panel" id="p-settings">
     <h2>Company</h2>
     <div class="card"><div id="companyBox"></div></div>
+    <h2>Subscription</h2>
+    <div class="card"><div id="billingBox"></div></div>
     <h2>Where receipts go</h2>
     <div class="card"><div id="hubdocBox"></div></div>
     <h2>About this page</h2>
@@ -1170,7 +1172,7 @@ async function loadAll() {
   const sinceISO = since.toISOString().slice(0, 10);
 
   // Everything is company-scoped by RLS, so these are plain selects.
-  const [profiles, sites, clocks, work, days, subs, mats, photos, company, allocs, requests] =
+  const [profiles, sites, clocks, work, days, subs, mats, photos, company, sub, allocs, requests] =
     await Promise.all([
       api("profiles?select=*&order=name"),
       api("sites?select=*&order=name"),
@@ -1182,6 +1184,7 @@ async function loadAll() {
       api("materials?select=*&order=date.desc&limit=200"),
       api("site_photos?select=*&order=timestamp.desc&limit=200"),
       api("companies?select=*&limit=1"),
+      api("rpc/my_subscription", { method: "POST", body: "{}" }).catch(() => null),
       api("work_allocations?select=*&date=gte." + sinceISO + "&order=date.desc").catch(() => []),
       api("material_requests?select=*&order=created_at.desc&limit=100").catch(() => [])
     ]);
@@ -1199,8 +1202,11 @@ async function loadAll() {
 
   DATA = {
     profiles, sites, clocks, work, days, subs, mats, photos, rates, details, allocs, requests,
-    company: (company && company[0]) || null, week
+    company: (company && company[0]) || null,
+    sub: (Array.isArray(sub) ? sub[0] : sub) || null,
+    week
   };
+  applyBranding(DATA.company);
   DATA.siteName = id => (sites.find(s => s.id === id) || {}).name || "—";
   DATA.person = id => profiles.find(p => p.id === id) || {};
   render();
@@ -1210,6 +1216,7 @@ async function loadAll() {
 
 function render() {
   fillFilters();
+  renderBilling();
   renderToday(); renderWeek(); renderPeople(); renderSites();
   renderInvoices(); renderEvidence(); renderSettings(); renderAllocations();
   renderGallery();
@@ -1827,6 +1834,14 @@ el("signout").addEventListener("click", () => {
 const C_OLIVE = "#7F9E4B", C_BLUE = "#3B6EA5", C_GRID = "#E8EBE4", C_INK = "#1A1D23",
       C_SOFT = "#5C626C";
 
+/** Axis tick text. Falls back to one decimal place when whole numbers would
+    make every tick read the same — four ticks all saying "£1" is worse than
+    no axis at all. */
+function axisLabel(opts, value) {
+  if (opts.fmtAxis) return opts.fmtAxis(value);
+  return value < 4 ? value.toFixed(1) : String(Math.round(value));
+}
+
 function svgEl(tag, attrs, text) {
   const parts = Object.entries(attrs || {})
     .map(([k, v]) => k + '="' + String(v).replace(/"/g, "&quot;") + '"').join(" ");
@@ -1845,7 +1860,9 @@ function barChart(rows, opts) {
   if (!rows.length) return '<div class="empty">Nothing to show yet.</div>';
   const W = 640, rowH = 34, padL = 130, padR = 66, padT = 8, padB = 26;
   const H = padT + rows.length * rowH + padB;
-  const max = Math.max(...rows.map(r => r.v), opts.min || 1);
+  const peak = Math.max(...rows.map(r => r.v), 0);
+  if (peak <= 0) return '<div class="empty">Nothing recorded yet.</div>';
+  const max = peak;
   const scale = v => (v / max) * (W - padL - padR);
 
   let s = '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" role="img" aria-label="'
@@ -1859,7 +1876,7 @@ function barChart(rows, opts) {
     s += svgEl("text", {
       x, y: H - padB + 16, "text-anchor": "middle", fill: C_SOFT,
       "font-size": 10.5, "font-family": "inherit"
-    }, opts.fmtAxis ? opts.fmtAxis((max * i) / ticks) : Math.round((max * i) / ticks));
+    }, axisLabel(opts, (max * i) / ticks));
   }
 
   rows.forEach((r, i) => {
@@ -1896,7 +1913,14 @@ function lineChart(series, labels, opts) {
   opts = opts || {};
   if (!labels.length) return '<div class="empty">Not enough history yet.</div>';
   const W = 640, H = 240, padL = 56, padR = 58, padT = 14, padB = 30;
-  const max = Math.max(1, ...series.flatMap(s => s.points));
+  // A max of 1 against all-zero data gives four axis labels that all round to
+  // "£1" and two end-labels stacked on the same pixel. Give an empty chart an
+  // honest empty scale and say so, rather than drawing a broken one.
+  const peak = Math.max(0, ...series.flatMap(s => s.points));
+  if (peak <= 0) {
+    return '<div class="empty">Nothing spent in this period yet.</div>';
+  }
+  const max = peak;
   const x = i => padL + (labels.length === 1 ? 0
     : ((W - padL - padR) * i) / (labels.length - 1));
   const y = v => padT + (H - padT - padB) * (1 - v / max);
@@ -1909,7 +1933,7 @@ function lineChart(series, labels, opts) {
     s += svgEl("text", {
       x: padL - 8, y: yy + 4, "text-anchor": "end", fill: C_SOFT, "font-size": 10.5,
       "font-family": "inherit"
-    }, opts.fmtAxis ? opts.fmtAxis(max * (1 - i / 4)) : Math.round(max * (1 - i / 4)));
+    }, axisLabel(opts, max * (1 - i / 4)));
   }
   labels.forEach((l, i) => {
     if (labels.length > 6 && i % 2) return;
@@ -2368,6 +2392,82 @@ function stopLive() {
   LIVE_TIMER = LIVE_RELOAD = null;
 }
 
+
+/* =====================================================================
+   Per-company branding and subscription state
+   ===================================================================== */
+
+/**
+ * Paints the page in the company's own colour and name.
+ *
+ * One page serves every customer. A separate generated copy per company
+ * would mean N files to keep in step, and the one that drifts is always the
+ * one nobody is looking at — so the differences live in the database and are
+ * applied at sign-in.
+ */
+function applyBranding(company) {
+  if (!company) return;
+  const primary = (company.brand_primary || "").trim();
+  // Only a hex colour, and only from our own database. This value goes
+  // straight into a stylesheet, and a CSS value is not an inert string.
+  if (/^#[0-9a-f]{6}$/i.test(primary)) {
+    const root = document.documentElement.style;
+    root.setProperty("--olive", primary);
+    root.setProperty("--olive-dark", shade(primary, -0.18));
+    root.setProperty("--light", shade(primary, 0.86));
+  }
+  if (company.name) {
+    document.title = company.name + " \u2014 Office";
+    const w = el("whoRole");
+    if (w && ME) w.textContent = (ME.role || "") + " \u00b7 " + company.name;
+  }
+  const logo = (company.brand_logo_url || "").trim();
+  if (/^https:\/\//i.test(logo)) {
+    document.querySelectorAll("header img").forEach(img => { img.src = logo; });
+  }
+}
+
+/** Lighten (amount > 0) or darken a hex colour. */
+function shade(hex, amount) {
+  const n = parseInt(hex.slice(1), 16);
+  const ch = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v =>
+    Math.max(0, Math.min(255, Math.round(amount < 0 ? v * (1 + amount) : v + (255 - v) * amount))));
+  return "#" + ch.map(v => v.toString(16).padStart(2, "0")).join("");
+}
+
+function renderBilling() {
+  const box = el("billingBox"); if (!box) return;
+  const s = DATA.sub;
+  if (!s) {
+    box.innerHTML = '<p class="muted" style="margin:0">No subscription on record for this '
+      + "company. Nothing is restricted \u2014 billing simply isn't switched on yet.</p>";
+    return;
+  }
+  const when = d => d ? new Date(d).toLocaleDateString("en-GB",
+    { day: "numeric", month: "long", year: "numeric" }) : "\u2014";
+  const pill = { active: "", trialing: "blue", past_due: "amber",
+                 canceled: "red", paused: "grey" }[s.status] ?? "grey";
+  const seats = Number(s.seats || 0), used = Number(s.seats_used || 0);
+  const over = used - seats;
+
+  box.innerHTML =
+    '<div class="kv"><span class="k">Plan</span><span class="strong">' + esc(s.plan) + "</span></div>"
+    + '<div class="kv"><span class="k">Status</span><span class="pill ' + pill + '">'
+      + esc(String(s.status).replace("_", " ")) + "</span></div>"
+    + '<div class="kv"><span class="k">People</span><span class="strong">'
+      + used + " of " + seats
+      + (over > 0 ? ' <span class="pill amber">' + over + " over</span>" : "") + "</span></div>"
+    + '<div class="kv"><span class="k">'
+      + (s.status === "trialing" ? "Trial ends" : "Renews") + '</span><span class="strong">'
+      + esc(when(s.status === "trialing" ? s.trial_ends_at : s.current_period_end)) + "</span></div>"
+    + (s.cancel_at_period_end
+        ? '<p class="muted" style="margin:10px 0 0">Set to cancel at the end of this period.</p>' : "")
+    + (s.can_write === false
+        ? '<div class="err" style="margin:12px 0 0">This account is read-only until the '
+          + "subscription is up to date. Existing records are safe and still visible, and day "
+          + "sheets and clock-ins keep working \u2014 only new sites and allocations are paused.</div>"
+        : "");
+}
 </script>
 </body>
 </html>
