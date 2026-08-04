@@ -894,6 +894,9 @@ svg.leaflet-image-layer.leaflet-interactive path {
     <div class="tiles" id="todayTiles"></div>
     <h2>On site</h2>
     <div class="card"><div id="onSite"></div></div>
+    <h2>What today is costing</h2>
+    <p class="lede" id="liveNote"></p>
+    <div class="card"><div id="liveCost"></div></div>
     <h2>Logged today</h2>
     <div class="card"><div id="todayWork"></div></div>
   </section>
@@ -908,12 +911,14 @@ svg.leaflet-image-layer.leaflet-interactive path {
   <section class="panel" id="p-people">
     <h2>People</h2>
     <p class="lede">Role and rate. Changes save straight away — there's no separate save button.</p>
+    <div style="margin-bottom:12px"><button class="btn" id="addPerson">Add someone</button></div>
     <div class="card"><div id="peopleTable"></div></div>
   </section>
 
   <section class="panel" id="p-sites">
     <h2>Sites</h2>
-    <p class="lede">One box per site. Click the map to move its zone, drag the slider to size it.</p>
+    <p class="lede">One box per site. Search an address, drag the pin, or click the map to place
+      the zone — then size it with the slider. Everything saves as you go.</p>
     <div style="margin-bottom:12px"><button class="btn" id="addSite">Add a site</button></div>
     <div id="siteCards"></div>
   </section>
@@ -1210,7 +1215,9 @@ function render() {
   renderGallery();
   PROGRESS_HANDLERS.length = 0;
   ROW_HANDLERS.length = 0;
+  GEO_HITS.length = 0;
   renderCommand();
+  renderLiveCost();
 }
 
 /** Keeps a chosen filter selected across a reload, so saving an edit does not
@@ -1765,6 +1772,7 @@ async function doSignIn() {
     el("gate").classList.add("hide");
     el("banner").innerHTML = '<div class="spin">Loading…</div>';
     await loadAll();
+    startLive();
     el("banner").innerHTML = "";
   } catch (e) {
     err.textContent = e.message;
@@ -1779,6 +1787,7 @@ async function doSignIn() {
 ["mapDays", "mapPerson"].forEach(id => el(id).addEventListener("change", renderMap));
 el("addSite").addEventListener("click", () => editSite(null));
 el("cmdAllocate").addEventListener("click", () => editAllocation(null));
+el("addPerson").addEventListener("click", addPerson);
 el("addAlloc").addEventListener("click", () => editAllocation(null));
 el("viewerClose").addEventListener("click", () => el("viewer").classList.remove("on"));
 el("viewer").addEventListener("click", e => {
@@ -1794,6 +1803,7 @@ el("signin").addEventListener("click", doSignIn);
 el("pw").addEventListener("keydown", e => { if (e.key === "Enter") doSignIn(); });
 el("email").addEventListener("keydown", e => { if (e.key === "Enter") el("pw").focus(); });
 el("signout").addEventListener("click", () => {
+  stopLive();
   TOKEN = null; ME = null; DATA = {};
   el("gate").classList.remove("hide");
   el("pw").value = "";
@@ -2094,7 +2104,8 @@ function renderSiteCards() {
             + ' onchange="saveRadius(\'' + s.id + '\',this.value)">'
             + '<span class="muted" id="rv_' + s.id + '">' + Math.round(s.geofence_radius || 150)
             + "m</span></div>"
-            + '<p class="muted" style="margin:10px 0 0">Click the map to move the zone.</p>'
+            + '<p class="muted" style="margin:10px 0 0">Drag the pin, or click the map, to move '
+            + "the zone.</p>" + addressSearchHTML(s.id)
             + '<div style="margin-top:10px"><button class="btn ghost" onclick="editSiteById(\''
             + s.id + '\')">Edit details</button></div>'
           : "")
@@ -2117,10 +2128,29 @@ function buildSiteMap(s) {
     radius: s.geofence_radius || 150, color: "#7F9E4B", weight: 2,
     fillColor: "#7F9E4B", fillOpacity: .15
   }).addTo(map);
-  SITE_MAPS[s.id] = { map, circle };
-  if (ME && ME.role === "Admin") {
+  const admin = ME && ME.role === "Admin";
+  // A draggable pin as well as click-to-place. Dragging is what people reach
+  // for, and clicking a map you are trying to pan is how a zone ends up in
+  // the middle of a field.
+  // A divIcon, not Leaflet's default marker: the default is a PNG sprite
+  // fetched by relative URL, and this page has no relative URLs — it is one
+  // file. Drawn in CSS instead, so there is nothing to 404.
+  const pin = L.divIcon({
+    className: "", iconSize: [22, 22], iconAnchor: [11, 11],
+    html: '<div style="width:22px;height:22px;border-radius:50%;background:#7F9E4B;'
+      + 'border:3px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);cursor:'
+      + (admin ? "grab" : "default") + '"></div>'
+  });
+  const marker = L.marker([lat, lng], { draggable: admin, autoPan: true, icon: pin }).addTo(map);
+  SITE_MAPS[s.id] = { map, circle, marker };
+  if (admin) {
+    marker.on("drag", e => circle.setLatLng(e.target.getLatLng()));
+    marker.on("dragend", e => {
+      const ll = e.target.getLatLng();
+      saveZone(s.id, ll.lat, ll.lng, circle.getRadius());
+    });
     map.on("click", e => {
-      circle.setLatLng(e.latlng);
+      circle.setLatLng(e.latlng); marker.setLatLng(e.latlng);
       saveZone(s.id, e.latlng.lat, e.latlng.lng, circle.getRadius());
     });
   }
@@ -2138,18 +2168,205 @@ async function saveRadius(id, v) {
   await saveZone(id, ll && ll.lat, ll && ll.lng, Number(v));
 }
 
-async function saveZone(id, lat, lng, radius) {
+async function saveZone(id, lat, lng, radius, address) {
   try {
-    await api("sites?id=eq." + id, { method: "PATCH", body: JSON.stringify({
+    const body = {
       latitude: lat, longitude: lng, geofence_radius: Math.round(radius)
-    }) });
+    };
+    // Only when the address came from a lookup. Dragging a pin two streets
+    // over should not rewrite an address somebody typed deliberately.
+    if (address) body.address = address;
+    await api("sites?id=eq." + id, { method: "PATCH", body: JSON.stringify(body) });
     const s = DATA.sites.find(x => x.id === id);
-    if (s) { s.latitude = lat; s.longitude = lng; s.geofence_radius = Math.round(radius); }
+    if (s) {
+      s.latitude = lat; s.longitude = lng; s.geofence_radius = Math.round(radius);
+      if (address) s.address = address;
+    }
     banner("ok", "Zone saved.");
   } catch (e) { banner("err", e.message); }
 }
 
 function editSiteById(id) { editSite(DATA.sites.find(s => s.id === id)); }
+
+/* =====================================================================
+   Address search, draggable zones, adding people, live cost
+   ===================================================================== */
+
+/* ---------- geocoding ----------
+   OpenStreetMap's Nominatim. Free, no key, and its usage policy asks for
+   no more than one request a second — so the box searches when you press
+   Enter or click Find, never on every keystroke. Results are biased to the
+   UK because every site in this app is. */
+
+let LAST_GEOCODE = 0;
+
+async function geocode(query) {
+  const wait = 1100 - (Date.now() - LAST_GEOCODE);
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  LAST_GEOCODE = Date.now();
+  const url = "https://nominatim.openstreetmap.org/search?format=json&limit=5&countrycodes=gb&q="
+    + encodeURIComponent(query);
+  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (!res.ok) throw new Error("Address lookup is unavailable right now.");
+  return (await res.json()).map(r => ({
+    label: r.display_name, lat: Number(r.lat), lng: Number(r.lon)
+  }));
+}
+
+/** Search box + result list, wired to a site's map. */
+function addressSearchHTML(siteId) {
+  return '<div style="display:flex;gap:6px;margin-top:12px">'
+    + '<input class="inline" style="flex:1;width:auto" placeholder="Search an address or postcode"'
+    + ' id="as_' + siteId + '" onkeydown="if(event.key===\'Enter\'){event.preventDefault();'
+    + "findAddress('" + siteId + "')}\">"
+    + '<button class="btn ghost" onclick="findAddress(\'' + siteId + '\')">Find</button></div>'
+    + '<div id="ar_' + siteId + '"></div>';
+}
+
+async function findAddress(siteId) {
+  const box = el("as_" + siteId), out = el("ar_" + siteId);
+  const q = (box.value || "").trim();
+  if (!q) return;
+  out.innerHTML = '<p class="muted" style="margin:8px 0 0">Looking…</p>';
+  try {
+    const hits = await geocode(q);
+    if (!hits.length) {
+      out.innerHTML = '<p class="muted" style="margin:8px 0 0">Nothing found for that.</p>';
+      return;
+    }
+    out.innerHTML = hits.map((h, i) => {
+      const idx = GEO_HITS.push({ siteId, hit: h }) - 1;
+      return '<button class="btn ghost" style="display:block;width:100%;text-align:left;'
+        + 'margin-top:6px;font-weight:400;font-size:12.5px" onclick="useAddress(' + idx + ')">'
+        + esc(h.label) + "</button>";
+    }).join("");
+  } catch (e) {
+    out.innerHTML = '<p class="muted" style="margin:8px 0 0">' + esc(e.message) + "</p>";
+  }
+}
+
+const GEO_HITS = [];
+
+async function useAddress(i) {
+  const g = GEO_HITS[i]; if (!g) return;
+  const m = SITE_MAPS[g.siteId];
+  if (m) {
+    m.circle.setLatLng([g.hit.lat, g.hit.lng]);
+    if (m.marker) m.marker.setLatLng([g.hit.lat, g.hit.lng]);
+    m.map.setView([g.hit.lat, g.hit.lng], 17);
+  }
+  el("ar_" + g.siteId).innerHTML = "";
+  await saveZone(g.siteId, g.hit.lat, g.hit.lng,
+    m ? m.circle.getRadius() : 150, g.hit.label);
+}
+
+/* ---------- adding people ----------
+   Not creating an account. Accounts are made by the person themselves, with
+   their own password, which is the only arrangement where nobody else has
+   ever known it. This mints an invite code they redeem when they sign up —
+   the same mechanism the app already uses. */
+
+function addPerson() {
+  openSheet("Add someone",
+    "This makes a code they use when they sign up. Their rate and trade are set once they're in.",
+    '<div class="field"><label>Role</label><select id="f_role">'
+      + ["Tradesman", "Site Manager", "Admin"].map(o => "<option>" + o + "</option>").join("")
+      + "</select></div>"
+    + '<div class="field"><label>Code lasts</label><select id="f_days">'
+      + '<option value="7">7 days</option><option value="14" selected>14 days</option>'
+      + '<option value="30">30 days</option></select></div>',
+    async () => {
+      const code = await api("rpc/create_role_invite", { method: "POST", body: JSON.stringify({
+        p_role: val("f_role"), p_expires_days: Number(val("f_days"))
+      }) });
+      showInviteCode(String(code).replace(/"/g, ""), val("f_role"));
+    });
+}
+
+function showInviteCode(code, role) {
+  // Deliberately not auto-closing. The code is the whole point of the
+  // exercise and closing the sheet on save would throw it away.
+  setTimeout(() => {
+    el("sheet").innerHTML = '<h3>Code for a new ' + esc(role.toLowerCase()) + "</h3>"
+      + '<p class="hint">Send them this. They enter it when they sign up in the app and land '
+      + "straight in your company.</p>"
+      + '<div style="font-size:30px;font-weight:700;letter-spacing:3px;text-align:center;'
+      + 'padding:18px;background:var(--light);border-radius:12px;font-family:ui-monospace,monospace">'
+      + esc(code) + "</div>"
+      + '<div class="sheet-actions"><button class="btn" onclick="closeModal()">Done</button></div>';
+    el("modal").classList.add("on");
+  }, 120);
+}
+
+/* ---------- live cost ----------
+   What the day is costing while it is being worked.
+
+   The clock ticks in the browser rather than being fetched — the figure
+   changes every second and the underlying facts change every few minutes,
+   so polling per second would be a lot of requests to watch a multiplication
+   happen. Data refreshes on its own every couple of minutes. */
+
+let LIVE_TIMER = null, LIVE_RELOAD = null;
+
+function liveCostRows() {
+  const t = todayISO();
+  const rate = uid => Number((DATA.rates || {})[uid] || 0);
+  const bySite = {};
+  const bump = (siteId, k, v) => {
+    const s = bySite[siteId] = bySite[siteId] || { onNow: 0, hours: 0, labour: 0, materials: 0 };
+    s[k] += v;
+  };
+
+  DATA.clocks.filter(c => c.date === t).forEach(c => {
+    const end = c.clock_out_time ? new Date(c.clock_out_time) : new Date();
+    const h = Math.max(0, (end - new Date(c.clock_in_time)) / 3600e3);
+    bump(c.site_id, "hours", h);
+    bump(c.site_id, "labour", h * rate(c.user_id));
+    if (!c.clock_out_time) bump(c.site_id, "onNow", 1);
+  });
+  DATA.mats.filter(m => (m.date || "").slice(0, 10) === t)
+    .forEach(m => bump(m.site_id, "materials", Number(m.cost_ex_vat || 0)));
+
+  return Object.entries(bySite).map(([siteId, s]) =>
+    Object.assign({ siteId, name: DATA.siteName(siteId) }, s))
+    .sort((a, b) => (b.onNow - a.onNow) || (b.labour - a.labour));
+}
+
+function renderLiveCost() {
+  const rows = liveCostRows();
+  const box = el("liveCost"); if (!box) return;
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">Nobody has clocked on today.</div>';
+    return;
+  }
+  box.innerHTML = table([
+    { t: "Site", f: r => "<b>" + esc(r.name) + "</b>"
+        + (r.onNow ? '<div class="muted">' + r.onNow + " on site now</div>" : "") },
+    { t: "On the clock", num: true, sm: true, f: r => hrs(r.hours) },
+    { t: "Labour", num: true, f: r => money(r.labour) },
+    { t: "Materials", num: true, sm: true, f: r => money(r.materials) },
+    { t: "Today", num: true, f: r => "<b>" + money(r.labour + r.materials) + "</b>" }
+  ], rows, "");
+  const live = rows.filter(r => r.onNow).length;
+  el("liveNote").textContent = live
+    ? "Ticking — " + live + (live === 1 ? " site has" : " sites have") + " someone on the clock."
+    : "Nobody is currently clocked on, so these totals are settled.";
+}
+
+function startLive() {
+  stopLive();
+  renderLiveCost();
+  // Every ten seconds is plenty: at £25/hour a second is under a penny, and
+  // a figure that flickers every second reads as noise rather than money.
+  LIVE_TIMER = setInterval(renderLiveCost, 10000);
+  LIVE_RELOAD = setInterval(() => { loadAll().catch(() => {}); }, 120000);
+}
+
+function stopLive() {
+  if (LIVE_TIMER) clearInterval(LIVE_TIMER);
+  if (LIVE_RELOAD) clearInterval(LIVE_RELOAD);
+  LIVE_TIMER = LIVE_RELOAD = null;
+}
 
 </script>
 </body>
